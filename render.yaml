@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: reels-bot
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
