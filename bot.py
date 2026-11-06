@@ -1,6 +1,7 @@
 """Telegram-бот: надсилаєш посилання на рілз з Instagram або Facebook — отримуєш відео."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +23,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # На Render задається автоматично — тоді бот працює через webhook, локально — через polling
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+# Telegram accepts only A-Z, a-z, 0-9, underscores and hyphens.
+if WEBHOOK_SECRET:
+    WEBHOOK_SECRET = hashlib.sha256(WEBHOOK_SECRET.encode()).hexdigest()
 PORT = int(os.environ.get("PORT", "10000"))
 
 
