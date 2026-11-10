@@ -104,12 +104,29 @@ def download(url: str, workdir: Path) -> tuple[Path, dict]:
                 info = ydl.extract_info(url, download=True)
         except Exception as e:  # noqa: BLE001 — yt-dlp кидає різні типи
             last_error = e
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                raise
             continue
         files = sorted(workdir.glob("video.*"), key=lambda p: p.stat().st_size, reverse=True)
         if files and files[0].stat().st_size <= MAX_BYTES:
             return files[0], probe(files[0])
         last_error = RuntimeError("Відео більше за 50 МБ навіть у низькій якості")
     raise last_error or RuntimeError("Не вдалося завантажити відео")
+
+
+def download_error_text(error: Exception) -> str:
+    detail = str(error)
+    if "429" in detail or "Too Many Requests" in detail:
+        return (
+            "❌ Instagram тимчасово обмежив запити із сервера (429). "
+            "Завантаження зупинено. Спробуйте пізніше; "
+            "повторне надсилання зараз не допоможе."
+        )
+    return (
+        "❌ Не вдалося завантажити відео. "
+        "Допис може бути недоступний або сервіс обмежив завантаження.\n\n"
+        + detail[:300]
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -145,12 +162,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await status.delete()
     except Exception as e:  # noqa: BLE001
         log.exception("Помилка для %s", url)
-        await status.edit_text(
-            "❌ Не вдалося завантажити відео.\n"
-            "Можливо, допис приватний або потрібен вхід в акаунт (див. README про cookies.txt).\n\n"
-            f"<code>{str(e)[:300]}</code>",
-            parse_mode="HTML",
-        )
+        error_text = download_error_text(e)
+        try:
+            await status.edit_text(error_text)
+        except Exception:
+            log.exception("Не вдалося оновити статус")
+            await update.message.reply_text(error_text)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         (workdir.parent / f"{workdir.name}_cookies.txt").unlink(missing_ok=True)
