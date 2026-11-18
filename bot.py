@@ -14,7 +14,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import TelegramError
+from telegram.error import NetworkError, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
 
@@ -149,21 +149,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
 
     workdir = Path(tempfile.mkdtemp(prefix="reel_"))
+    downloaded = False
     try:
         path, info = await asyncio.to_thread(download, url, workdir)
-        with path.open("rb") as f:
-            sent_video = await update.message.reply_video(
-                video=f,
-                supports_streaming=True,
-                width=info.get("width"),
-                height=info.get("height"),
-                duration=int(info["duration"]) if info.get("duration") else None,
-                read_timeout=120,
-                write_timeout=120,
-            )
+        downloaded = True
+        try:
+            with path.open("rb") as f:
+                sent_media = await update.message.reply_video(
+                    video=f,
+                    supports_streaming=True,
+                    width=info.get("width"),
+                    height=info.get("height"),
+                    duration=int(info["duration"]) if info.get("duration") else None,
+                    read_timeout=120,
+                    write_timeout=120,
+                )
+        except NetworkError as error:
+            if "Internal Server Error" not in str(error):
+                raise
+            log.warning("Telegram відхилив відео; надсилаємо як файл")
+            with path.open("rb") as f:
+                sent_media = await update.message.reply_document(
+                    document=f, read_timeout=120, write_timeout=120,
+                )
     except Exception as e:  # noqa: BLE001
         log.exception("Помилка для %s", url)
-        error_text = download_error_text(e)
+        error_text = (
+            "❌ Відео завантажено, але Telegram не прийняв файл. Спробуй пізніше."
+            if downloaded else download_error_text(e)
+        )
         try:
             await status.edit_text(error_text)
         except Exception:
@@ -179,10 +193,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception:
         log.warning("Не вдалося прибрати статус завантаження", exc_info=True)
 
-    if update.effective_chat.type == "private" and sent_video.video:
+    if update.effective_chat.type == "private":
         items = context.chat_data.setdefault("session_videos", {})
-        add_session_video(items, sent_video)
-        await publish_session_summary(sent_video, context, items)
+        if sent_media.video:
+            add_session_video(items, sent_media)
+        elif info.get("duration"):
+            items[sent_media.message_id] = int(info["duration"])
+        else:
+            await sent_media.reply_text("Файл надіслано, але його тривалість не вдалося визначити.")
+            return
+        await publish_session_summary(sent_media, context, items)
 
 
 SESSION_KEYBOARD = ReplyKeyboardMarkup(
