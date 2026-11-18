@@ -14,6 +14,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
 
@@ -181,7 +182,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.effective_chat.type == "private" and sent_video.video:
         items = context.chat_data.setdefault("session_videos", {})
         add_session_video(items, sent_video)
-        await sent_video.reply_text(session_summary(items), reply_markup=SESSION_KEYBOARD)
+        await publish_session_summary(sent_video, context, items)
 
 
 SESSION_KEYBOARD = ReplyKeyboardMarkup(
@@ -226,7 +227,18 @@ async def session_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    await message.reply_text(session_summary(items), reply_markup=SESSION_KEYBOARD)
+    await publish_session_summary(message, context, items)
+
+
+async def publish_session_summary(message: Message, context: ContextTypes.DEFAULT_TYPE, items: dict[int, int]) -> None:
+    previous_id = context.chat_data.get("session_summary_id")
+    summary = await message.reply_text(session_summary(items), reply_markup=SESSION_KEYBOARD)
+    context.chat_data["session_summary_id"] = summary.message_id
+    if previous_id is not None:
+        try:
+            await context.bot.delete_message(chat_id=message.chat_id, message_id=previous_id)
+        except TelegramError:
+            log.warning("Не вдалося видалити попередній підсумок сесії", exc_info=True)
 
 
 def add_session_video(items: dict[int, int], message: Message) -> None:
