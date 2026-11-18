@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
@@ -131,7 +131,8 @@ def download_error_text(error: Exception) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Привіт! Надішли посилання на рілз з Instagram або Facebook — і я поверну відео."
+        "Привіт! Надішли посилання на рілз з Instagram або Facebook — і я поверну відео.",
+        reply_markup=SESSION_KEYBOARD,
     )
 
 
@@ -173,11 +174,72 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         (workdir.parent / f"{workdir.name}_cookies.txt").unlink(missing_ok=True)
 
 
+SESSION_KEYBOARD = ReplyKeyboardMarkup(
+    [["Підрахувати", "Вивантажити сесію"], ["Нова сесія"]],
+    resize_keyboard=True,
+)
+
+
+def clock_text(seconds: int) -> str:
+    minutes, seconds = divmod(seconds, 60)
+    return f"{minutes:02}:{seconds:02}"
+
+
+async def session_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    items = context.chat_data.setdefault("session_videos", {})
+    action = message.text
+    if action == "Нова сесія":
+        items.clear()
+        await message.reply_text("Нову сесію розпочато. Надішли відео.", reply_markup=SESSION_KEYBOARD)
+        return
+
+    if message.video:
+        items[message.message_id] = int(message.video.duration.total_seconds()) if hasattr(message.video.duration, 'total_seconds') else message.video.duration
+    elif message.document:
+        await message.reply_text(
+            "Надішли це відео як відеоповідомлення, щоб Telegram передав тривалість.",
+            reply_markup=SESSION_KEYBOARD,
+        )
+        return
+
+    if not items:
+        await message.reply_text("Сесія порожня.", reply_markup=SESSION_KEYBOARD)
+        return
+
+    total = sum(items.values())
+    if action == "Вивантажити сесію":
+        manifest = {"messages": sorted(items), "seconds": total}
+        await message.reply_text(
+            "Запит на вивантаження на Mac.\nREELS_EXPORT_V1 " + json.dumps(manifest),
+            reply_markup=SESSION_KEYBOARD,
+        )
+        return
+
+    if total < 480:
+        target = f"до 8 хв ще {clock_text(480 - total)}"
+    elif total <= 600:
+        target = "у межах 8–10 хв"
+    else:
+        target = f"понад 10 хв на {clock_text(total - 600)}"
+    await message.reply_text(
+        f"Відео: {len(items)} · хрон {clock_text(total)} · {target}",
+        reply_markup=SESSION_KEYBOARD,
+    )
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Не задано BOT_TOKEN — створи файл .env (див. .env.example)")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & (
+            filters.VIDEO | filters.Document.VIDEO
+            | filters.Regex(r"^(Підрахувати|Вивантажити сесію|Нова сесія)$")
+        ),
+        session_message,
+    ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     if WEBHOOK_URL:
         log.info("Бот запущено (webhook): %s", WEBHOOK_URL)
