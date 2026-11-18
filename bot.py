@@ -2,20 +2,26 @@
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
+
+import diag
 
 load_dotenv(Path(__file__).with_name(".env"))
 
@@ -23,10 +29,16 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # На Render задається автоматично — тоді бот працює через webhook, локально — через polling
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+# Сирий секрет з Render → Environment — ключ для завантаження діагностичних файлів
+DIAG_KEY = WEBHOOK_SECRET
 # Telegram accepts only A-Z, a-z, 0-9, underscores and hyphens.
 if WEBHOOK_SECRET:
     WEBHOOK_SECRET = hashlib.sha256(WEBHOOK_SECRET.encode()).hexdigest()
 PORT = int(os.environ.get("PORT", "10000"))
+# Діагностика 500 на sendVideo. На безкоштовному Render /tmp очищується при перезапуску й засинанні
+DIAG_DIR = Path(os.environ.get("DIAG_DIR", "/tmp/diag"))
+DIAG_FILES = {"last_failed.mp4", "last_failed.json", "results.json"}
+CONTROL_MP4 = Path(__file__).with_name("control.mp4")
 
 
 def find_cookies() -> Path | None:
@@ -148,21 +160,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
 
     workdir = Path(tempfile.mkdtemp(prefix="reel_"))
+    path = None
+    params = {}
     try:
         path, info = await asyncio.to_thread(download, url, workdir)
+        params = {
+            "supports_streaming": True,
+            "width": info.get("width"),
+            "height": info.get("height"),
+            "duration": int(info["duration"]) if info.get("duration") else None,
+        }
         with path.open("rb") as f:
             sent_video = await update.message.reply_video(
                 video=f,
-                supports_streaming=True,
-                width=info.get("width"),
-                height=info.get("height"),
-                duration=int(info["duration"]) if info.get("duration") else None,
+                **params,
                 read_timeout=120,
                 write_timeout=120,
             )
-        await status.delete()
     except Exception as e:  # noqa: BLE001
         log.exception("Помилка для %s", url)
+        if path is not None and path.exists():
+            # Файл уже завантажено — впало саме надсилання в Telegram. Зберігаємо точні байти.
+            try:
+                await asyncio.to_thread(save_failed, path, url, params, e, update.effective_chat.id)
+            except Exception:
+                log.exception("Не вдалося зберегти файл для діагностики")
         error_text = download_error_text(e)
         try:
             await status.edit_text(error_text)
@@ -174,11 +196,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         shutil.rmtree(workdir, ignore_errors=True)
         (workdir.parent / f"{workdir.name}_cookies.txt").unlink(missing_ok=True)
 
+    try:
+        await status.delete()
+    except Exception:
+        log.warning("Не вдалося прибрати статус завантаження", exc_info=True)
+
     if update.effective_chat.type == "private" and sent_video.video:
         items = context.chat_data.setdefault("session_videos", {})
-        duration = sent_video.video.duration
-        items[sent_video.message_id] = int(duration.total_seconds()) if hasattr(duration, "total_seconds") else duration
+        add_session_video(items, sent_video)
         await sent_video.reply_text(session_summary(items), reply_markup=SESSION_KEYBOARD)
+
+
+def save_failed(path: Path, url: str, params: dict, error: Exception, chat_id: int) -> None:
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    target = DIAG_DIR / "last_failed.mp4"
+    shutil.copyfile(path, target)
+    meta = {
+        "utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "url": url,
+        "chat_id": chat_id,
+        "params": params,
+        "error": f"{type(error).__name__}: {error}",
+        "traceback": "".join(traceback.format_exception(error))[-4000:],
+        "probe": diag.probe(target),
+        "versions": diag.versions(),
+    }
+    (DIAG_DIR / "last_failed.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+    log.info("DIAG збережено last_failed.mp4: %s", json.dumps(meta["probe"], ensure_ascii=False))
+
+
+async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Контрольний тест з Render: той самий код надсилання, що й `python diag.py matrix` на Mac."""
+    chat_id = update.effective_chat.id
+    files = [CONTROL_MP4]
+    meta_path = DIAG_DIR / "last_failed.json"
+    failed = DIAG_DIR / "last_failed.mp4"
+    if failed.exists() and meta_path.exists():
+        # Проблемний файл надсилаємо лише в чат, де він упав
+        if json.loads(meta_path.read_text()).get("chat_id") == chat_id:
+            files.append(failed)
+    with_variants = "variants" in (context.args or [])
+    await update.message.reply_text(
+        f"🔬 Діагностика: {', '.join(f.name for f in files)}"
+        + (" + перепаковані копії" if with_variants and len(files) > 1 else "")
+        + ". Це займе 1–3 хв."
+    )
+    if with_variants and len(files) > 1:
+        files += await asyncio.to_thread(diag.make_variants, failed, DIAG_DIR / "variants")
+    report = await diag.run_matrix(BOT_TOKEN, str(chat_id), files, origin="render", log=log.info)
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    (DIAG_DIR / "results.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    await update.message.reply_text(diag.summary(report)[:4000])
 
 
 SESSION_KEYBOARD = ReplyKeyboardMarkup(
@@ -202,7 +270,7 @@ async def session_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if message.video:
-        items[message.message_id] = int(message.video.duration.total_seconds()) if hasattr(message.video.duration, 'total_seconds') else message.video.duration
+        add_session_video(items, message)
     elif message.document:
         await message.reply_text(
             "Надішли це відео як відеоповідомлення, щоб Telegram передав тривалість.",
@@ -226,6 +294,11 @@ async def session_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await message.reply_text(session_summary(items), reply_markup=SESSION_KEYBOARD)
 
 
+def add_session_video(items: dict[int, int], message: Message) -> None:
+    duration = message.video.duration
+    items[message.message_id] = int(duration.total_seconds()) if hasattr(duration, "total_seconds") else duration
+
+
 def session_summary(items: dict[int, int]) -> str:
     total = sum(items.values())
     if total < 480:
@@ -237,11 +310,71 @@ def session_summary(items: dict[int, int]) -> str:
     return f"Відео: {len(items)} · хрон {clock_text(total)} · {target}"
 
 
+async def serve_webhook(app: Application) -> None:
+    """Webhook на власному tornado-сервері: крім /webhook він віддає діагностичні файли
+    окремим від Telegram каналом (GET /diag/<файл> з заголовком X-Diag-Key)."""
+    import tornado.web
+
+    class WebhookHandler(tornado.web.RequestHandler):
+        async def post(self):
+            token = self.request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if WEBHOOK_SECRET and not hmac.compare_digest(token, WEBHOOK_SECRET):
+                self.set_status(403)
+                return
+            update = Update.de_json(json.loads(self.request.body), app.bot)
+            await app.update_queue.put(update)
+
+    class DiagHandler(tornado.web.RequestHandler):
+        async def get(self, name):
+            key = self.request.headers.get("X-Diag-Key", "")
+            if not DIAG_KEY or not hmac.compare_digest(key, DIAG_KEY):
+                self.set_status(403)
+                return
+            path = DIAG_DIR / name
+            if name not in DIAG_FILES or not path.exists():
+                self.set_status(404)
+                return
+            self.set_header("Content-Type", "video/mp4" if name.endswith(".mp4") else "application/json")
+            self.set_header("Content-Length", str(path.stat().st_size))
+            with path.open("rb") as f:
+                while chunk := f.read(1 << 20):
+                    self.write(chunk)
+                    await self.flush()
+
+    class HealthHandler(tornado.web.RequestHandler):
+        def get(self):
+            self.write("ok")
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
+
+    async with app:
+        await app.bot.set_webhook(
+            url=f"{WEBHOOK_URL.rstrip('/')}/webhook",
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=Update.ALL_TYPES,
+        )
+        await app.start()
+        server = tornado.web.Application([
+            (r"/webhook", WebhookHandler),
+            (r"/diag/([\w.]+)", DiagHandler),
+            (r"/", HealthHandler),
+        ]).listen(PORT, address="0.0.0.0")
+        log.info("Бот запущено (webhook): %s", WEBHOOK_URL)
+        await stop.wait()
+        server.stop()
+        await app.stop()
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Не задано BOT_TOKEN — створи файл .env (див. .env.example)")
+    log.info("DIAG версії: %s", json.dumps(diag.versions(), ensure_ascii=False))
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("diag", diag_command, filters=filters.ChatType.PRIVATE))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & (
             filters.VIDEO | filters.Document.VIDEO
@@ -251,15 +384,7 @@ def main() -> None:
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     if WEBHOOK_URL:
-        log.info("Бот запущено (webhook): %s", WEBHOOK_URL)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path="webhook",
-            webhook_url=f"{WEBHOOK_URL.rstrip('/')}/webhook",
-            secret_token=WEBHOOK_SECRET,
-            allowed_updates=Update.ALL_TYPES,
-        )
+        asyncio.run(serve_webhook(app))
     else:
         log.info("Бот запущено (polling)")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
