@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
@@ -151,7 +151,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         path, info = await asyncio.to_thread(download, url, workdir)
         with path.open("rb") as f:
-            await update.message.reply_video(
+            sent_video = await update.message.reply_video(
                 video=f,
                 supports_streaming=True,
                 width=info.get("width"),
@@ -160,7 +160,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 read_timeout=120,
                 write_timeout=120,
             )
-        await status.delete()
     except Exception as e:  # noqa: BLE001
         log.exception("Помилка для %s", url)
         error_text = download_error_text(e)
@@ -169,9 +168,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception:
             log.exception("Не вдалося оновити статус")
             await update.message.reply_text(error_text)
+        return
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         (workdir.parent / f"{workdir.name}_cookies.txt").unlink(missing_ok=True)
+
+    try:
+        await status.delete()
+    except Exception:
+        log.warning("Не вдалося прибрати статус завантаження", exc_info=True)
+
+    if update.effective_chat.type == "private" and sent_video.video:
+        items = context.chat_data.setdefault("session_videos", {})
+        add_session_video(items, sent_video)
+        await sent_video.reply_text(session_summary(items), reply_markup=SESSION_KEYBOARD)
 
 
 SESSION_KEYBOARD = ReplyKeyboardMarkup(
@@ -195,7 +205,7 @@ async def session_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if message.video:
-        items[message.message_id] = int(message.video.duration.total_seconds()) if hasattr(message.video.duration, 'total_seconds') else message.video.duration
+        add_session_video(items, message)
     elif message.document:
         await message.reply_text(
             "Надішли це відео як відеоповідомлення, щоб Telegram передав тривалість.",
@@ -216,45 +226,20 @@ async def session_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
+    await message.reply_text(session_summary(items), reply_markup=SESSION_KEYBOARD)
+
+
+def add_session_video(items: dict[int, int], message: Message) -> None:
+    duration = message.video.duration
+    items[message.message_id] = int(duration.total_seconds()) if hasattr(duration, "total_seconds") else duration
+
+
+def session_summary(items: dict[int, int]) -> str:
+    total = sum(items.values())
     if total < 480:
         target = f"до 8 хв ще {clock_text(480 - total)}"
     elif total <= 600:
         target = "у межах 8–10 хв"
     else:
         target = f"понад 10 хв на {clock_text(total - 600)}"
-    await message.reply_text(
-        f"Відео: {len(items)} · хрон {clock_text(total)} · {target}",
-        reply_markup=SESSION_KEYBOARD,
-    )
-
-
-def main() -> None:
-    if not BOT_TOKEN:
-        raise SystemExit("Не задано BOT_TOKEN — створи файл .env (див. .env.example)")
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & (
-            filters.VIDEO | filters.Document.VIDEO
-            | filters.Regex(r"^(Підрахувати|Вивантажити сесію|Нова сесія)$")
-        ),
-        session_message,
-    ))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    if WEBHOOK_URL:
-        log.info("Бот запущено (webhook): %s", WEBHOOK_URL)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path="webhook",
-            webhook_url=f"{WEBHOOK_URL.rstrip('/')}/webhook",
-            secret_token=WEBHOOK_SECRET,
-            allowed_updates=Update.ALL_TYPES,
-        )
-    else:
-        log.info("Бот запущено (polling)")
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+    return f"Відео: {len(items)} · хрон {clock_text(total)} · {target}"
