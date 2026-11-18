@@ -137,6 +137,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def prepare_smaller_video(source: Path, destination: Path, duration: float) -> None:
+    # Leave room for audio and container overhead within a 20 MB target.
+    bitrate = max(80, min(1400, int(18_000_000 * 8 / duration / 1000) - 64))
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(source),
+         "-map", "0:v:0", "-map", "0:a:0?", "-vf",
+         "scale=640:640:force_original_aspect_ratio=decrease:force_divisible_by=2",
+         "-c:v", "libx264", "-preset", "ultrafast", "-threads", "2",
+         "-pix_fmt", "yuv420p", "-b:v", f"{bitrate}k", "-maxrate", f"{bitrate}k",
+         "-bufsize", f"{2 * bitrate}k", "-c:a", "aac", "-b:a", "64k",
+         "-movflags", "+faststart", str(destination)],
+        check=True, timeout=120,
+    )
+    if destination.stat().st_size > min(source.stat().st_size, 20_000_000):
+        raise ValueError("Не вдалося підготувати меншу копію відео")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or update.message.caption or ""
     match = URL_RE.search(text)
@@ -168,10 +185,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if "Internal Server Error" not in str(error):
                 raise
             log.warning("Telegram відхилив відео; надсилаємо як файл")
-            with path.open("rb") as f:
-                sent_media = await update.message.reply_document(
-                    document=f, read_timeout=120, write_timeout=120,
-                )
+            try:
+                with path.open("rb") as f:
+                    sent_media = await update.message.reply_document(
+                        document=f, read_timeout=120, write_timeout=120,
+                    )
+            except NetworkError as document_error:
+                if "Internal Server Error" not in str(document_error) or not info.get("duration"):
+                    raise
+                compact_path = workdir / "video-compact.mp4"
+                log.warning("Telegram відхилив і документ; готуємо меншу копію MP4")
+                await asyncio.to_thread(prepare_smaller_video, path, compact_path, info["duration"])
+                with compact_path.open("rb") as f:
+                    sent_media = await update.message.reply_document(
+                        document=f, read_timeout=120, write_timeout=120,
+                    )
     except Exception as e:  # noqa: BLE001
         log.exception("Помилка для %s", url)
         error_text = (
