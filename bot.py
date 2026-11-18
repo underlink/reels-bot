@@ -243,3 +243,35 @@ def session_summary(items: dict[int, int]) -> str:
     else:
         target = f"понад 10 хв на {clock_text(total - 600)}"
     return f"Відео: {len(items)} · хрон {clock_text(total)} · {target}"
+
+
+def main() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("Не задано BOT_TOKEN — створи файл .env (див. .env.example)")
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & (
+            filters.VIDEO | filters.Document.VIDEO
+            | filters.Regex(r"^(Підрахувати|Вивантажити сесію|Нова сесія)$")
+        ),
+        session_message,
+    ))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    if WEBHOOK_URL:
+        log.info("Бот запущено (webhook): %s", WEBHOOK_URL)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="webhook",
+            webhook_url=f"{WEBHOOK_URL.rstrip('/')}/webhook",
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        log.info("Бот запущено (polling)")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
