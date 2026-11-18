@@ -12,9 +12,8 @@ import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Message, ReplyKeyboardMarkup, Update
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import NetworkError, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
 
@@ -137,23 +136,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def prepare_smaller_video(source: Path, destination: Path, duration: float) -> None:
-    # Leave room for audio and container overhead within a 20 MB target.
-    bitrate = max(80, min(1400, int(18_000_000 * 8 / duration / 1000) - 64))
-    subprocess.run(
-        ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(source),
-         "-map", "0:v:0", "-map", "0:a:0?", "-vf",
-         "scale=640:640:force_original_aspect_ratio=decrease:force_divisible_by=2",
-         "-c:v", "libx264", "-preset", "ultrafast", "-threads", "2",
-         "-pix_fmt", "yuv420p", "-b:v", f"{bitrate}k", "-maxrate", f"{bitrate}k",
-         "-bufsize", f"{2 * bitrate}k", "-c:a", "aac", "-b:a", "64k",
-         "-movflags", "+faststart", str(destination)],
-        check=True, timeout=120,
-    )
-    if destination.stat().st_size > min(source.stat().st_size, 20_000_000):
-        raise ValueError("Не вдалося підготувати меншу копію відео")
-
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or update.message.caption or ""
     match = URL_RE.search(text)
@@ -166,46 +148,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
 
     workdir = Path(tempfile.mkdtemp(prefix="reel_"))
-    downloaded = False
     try:
         path, info = await asyncio.to_thread(download, url, workdir)
-        downloaded = True
-        try:
-            with path.open("rb") as f:
-                sent_media = await update.message.reply_video(
-                    video=f,
-                    supports_streaming=True,
-                    width=info.get("width"),
-                    height=info.get("height"),
-                    duration=int(info["duration"]) if info.get("duration") else None,
-                    read_timeout=120,
-                    write_timeout=120,
-                )
-        except NetworkError as error:
-            if "Internal Server Error" not in str(error):
-                raise
-            log.warning("Telegram відхилив відео; надсилаємо як файл")
-            try:
-                with path.open("rb") as f:
-                    sent_media = await update.message.reply_document(
-                        document=f, read_timeout=120, write_timeout=120,
-                    )
-            except NetworkError as document_error:
-                if "Internal Server Error" not in str(document_error) or not info.get("duration"):
-                    raise
-                compact_path = workdir / "video-compact.mp4"
-                log.warning("Telegram відхилив і документ; готуємо меншу копію MP4")
-                await asyncio.to_thread(prepare_smaller_video, path, compact_path, info["duration"])
-                with compact_path.open("rb") as f:
-                    sent_media = await update.message.reply_document(
-                        document=f, read_timeout=120, write_timeout=120,
-                    )
+        with path.open("rb") as f:
+            sent_video = await update.message.reply_video(
+                video=f,
+                supports_streaming=True,
+                width=info.get("width"),
+                height=info.get("height"),
+                duration=int(info["duration"]) if info.get("duration") else None,
+                read_timeout=120,
+                write_timeout=120,
+            )
+        await status.delete()
     except Exception as e:  # noqa: BLE001
         log.exception("Помилка для %s", url)
-        error_text = (
-            "❌ Відео завантажено, але Telegram не прийняв файл. Спробуй пізніше."
-            if downloaded else download_error_text(e)
-        )
+        error_text = download_error_text(e)
         try:
             await status.edit_text(error_text)
         except Exception:
@@ -216,21 +174,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         shutil.rmtree(workdir, ignore_errors=True)
         (workdir.parent / f"{workdir.name}_cookies.txt").unlink(missing_ok=True)
 
-    try:
-        await status.delete()
-    except Exception:
-        log.warning("Не вдалося прибрати статус завантаження", exc_info=True)
-
-    if update.effective_chat.type == "private":
+    if update.effective_chat.type == "private" and sent_video.video:
         items = context.chat_data.setdefault("session_videos", {})
-        if sent_media.video:
-            add_session_video(items, sent_media)
-        elif info.get("duration"):
-            items[sent_media.message_id] = int(info["duration"])
-        else:
-            await sent_media.reply_text("Файл надіслано, але його тривалість не вдалося визначити.")
-            return
-        await publish_session_summary(sent_media, context, items)
+        duration = sent_video.video.duration
+        items[sent_video.message_id] = int(duration.total_seconds()) if hasattr(duration, "total_seconds") else duration
+        await sent_video.reply_text(session_summary(items), reply_markup=SESSION_KEYBOARD)
 
 
 SESSION_KEYBOARD = ReplyKeyboardMarkup(
@@ -254,7 +202,7 @@ async def session_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if message.video:
-        add_session_video(items, message)
+        items[message.message_id] = int(message.video.duration.total_seconds()) if hasattr(message.video.duration, 'total_seconds') else message.video.duration
     elif message.document:
         await message.reply_text(
             "Надішли це відео як відеоповідомлення, щоб Telegram передав тривалість.",
@@ -275,23 +223,7 @@ async def session_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    await publish_session_summary(message, context, items)
-
-
-async def publish_session_summary(message: Message, context: ContextTypes.DEFAULT_TYPE, items: dict[int, int]) -> None:
-    previous_id = context.chat_data.get("session_summary_id")
-    summary = await message.reply_text(session_summary(items), reply_markup=SESSION_KEYBOARD)
-    context.chat_data["session_summary_id"] = summary.message_id
-    if previous_id is not None:
-        try:
-            await context.bot.delete_message(chat_id=message.chat_id, message_id=previous_id)
-        except TelegramError:
-            log.warning("Не вдалося видалити попередній підсумок сесії", exc_info=True)
-
-
-def add_session_video(items: dict[int, int], message: Message) -> None:
-    duration = message.video.duration
-    items[message.message_id] = int(duration.total_seconds()) if hasattr(duration, "total_seconds") else duration
+    await message.reply_text(session_summary(items), reply_markup=SESSION_KEYBOARD)
 
 
 def session_summary(items: dict[int, int]) -> str:
