@@ -121,13 +121,13 @@ def prepare_mp4(source: Path) -> Path:
         ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(source),
          "-map", "0:v:0", "-map", "0:a:0?", *video_options, *audio_options,
          "-movflags", "+faststart", str(output)],
-        capture_output=True, text=True, timeout=120, check=True,
+        capture_output=True, text=True, timeout=40, check=True,
     )
     return output
 
 
-def download(url: str, workdir: Path) -> tuple[Path, dict]:
-    """Завантажує відео й повертає шлях до файлу та метадані."""
+def download(url: str, workdir: Path) -> tuple[Path, dict, str | None]:
+    """Повертає шлях, метадані та примітку, якщо надсилаємо оригінал."""
     last_error = None
     for fmt in FORMATS:
         for f in workdir.iterdir():
@@ -158,14 +158,17 @@ def download(url: str, workdir: Path) -> tuple[Path, dict]:
         if files and files[0].stat().st_size <= MAX_BYTES:
             try:
                 output = prepare_mp4(files[0])
-            except subprocess.TimeoutExpired as error:
-                raise RuntimeError("Підготовка MP4 перевищила 120 секунд") from error
+            except subprocess.TimeoutExpired:
+                log.warning("Підготовка MP4 перевищила ліміт часу. Надсилаємо оригінал.")
+                return files[0], probe(files[0]), (
+                    "Надсилаю оригінал. Конвертація для Premiere не вклалася в ліміт часу."
+                )
             except (subprocess.SubprocessError, ValueError, KeyError, StopIteration) as error:
                 log.warning("Не вдалося підготувати MP4: %s", error)
                 last_error = RuntimeError("Не вдалося підготувати сумісний MP4")
                 continue
             if 0 < output.stat().st_size <= MAX_BYTES:
-                return output, probe(output)
+                return output, probe(output), None
         last_error = RuntimeError("Відео більше за 50 МБ навіть у низькій якості")
     raise last_error or RuntimeError("Не вдалося завантажити відео")
 
@@ -207,7 +210,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     path = None
     params = {}
     try:
-        path, info = await asyncio.to_thread(download, url, workdir)
+        path, info, caption = await asyncio.to_thread(download, url, workdir)
         params = {
             "supports_streaming": True,
             "width": info.get("width"),
@@ -217,6 +220,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         with path.open("rb") as f:
             await update.message.reply_video(
                 video=f,
+                caption=caption,
                 **params,
                 read_timeout=120,
                 write_timeout=120,
