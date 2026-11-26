@@ -61,7 +61,11 @@ URL_RE = re.compile(
 
 # Від найкращої якості до найлегшої — беремо першу, що влазить у 50 МБ
 FORMATS = [
+    "bv*[vcodec^=avc1][height<=1080]+ba[acodec^=mp4a]/"
+    "b[vcodec^=avc1][acodec^=mp4a][height<=1080]/"
     "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4][height<=1080]/bv*[height<=1080]+ba/b",
+    "bv*[vcodec^=avc1][height<=720]+ba[acodec^=mp4a]/"
+    "b[vcodec^=avc1][acodec^=mp4a][height<=720]/"
     "bv*[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/bv*[height<=720]+ba/b",
     "bv*[height<=480]+ba/b[height<=480]/worst",
 ]
@@ -103,8 +107,10 @@ def prepare_mp4(source: Path) -> Path:
     video_options = ["-c:v", "copy"]
     if video.get("codec_name") != "h264" or video.get("pix_fmt") != "yuv420p":
         video_options = [
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2",
-            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-threads", "2",
+            "-vf", "scale='min(1280,iw)':'min(1280,ih)':"
+                   "force_original_aspect_ratio=decrease:force_divisible_by=2",
+            "-pix_fmt", "yuv420p",
         ]
     audio_options = ["-c:a", "copy"]
     if audio and (audio.get("codec_name") != "aac" or audio.get("profile") != "LC"):
@@ -152,6 +158,8 @@ def download(url: str, workdir: Path) -> tuple[Path, dict]:
         if files and files[0].stat().st_size <= MAX_BYTES:
             try:
                 output = prepare_mp4(files[0])
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError("Підготовка MP4 перевищила 120 секунд") from error
             except (subprocess.SubprocessError, ValueError, KeyError, StopIteration) as error:
                 log.warning("Не вдалося підготувати MP4: %s", error)
                 last_error = RuntimeError("Не вдалося підготувати сумісний MP4")
