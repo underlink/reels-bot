@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Message, ReplyKeyboardMarkup, Update
+from telegram import ReplyKeyboardRemove, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
@@ -144,7 +144,7 @@ def download_error_text(error: Exception) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Привіт! Надішли посилання на рілз з Instagram або Facebook — і я поверну відео.",
-        reply_markup=SESSION_KEYBOARD,
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -156,7 +156,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     url = match.group(0)
-    status = await update.message.reply_text("⏳ Завантажую…")
+    status = await update.message.reply_text("⏳ Завантажую…", reply_markup=ReplyKeyboardRemove())
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
 
     workdir = Path(tempfile.mkdtemp(prefix="reel_"))
@@ -171,7 +171,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "duration": int(info["duration"]) if info.get("duration") else None,
         }
         with path.open("rb") as f:
-            sent_video = await update.message.reply_video(
+            await update.message.reply_video(
                 video=f,
                 **params,
                 read_timeout=120,
@@ -200,11 +200,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await status.delete()
     except Exception:
         log.warning("Не вдалося прибрати статус завантаження", exc_info=True)
-
-    if update.effective_chat.type == "private" and sent_video.video:
-        items = context.chat_data.setdefault("session_videos", {})
-        add_session_video(items, sent_video)
-        await sent_video.reply_text(session_summary(items), reply_markup=SESSION_KEYBOARD)
 
 
 def save_failed(path: Path, url: str, params: dict, error: Exception, chat_id: int) -> None:
@@ -247,67 +242,6 @@ async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     DIAG_DIR.mkdir(parents=True, exist_ok=True)
     (DIAG_DIR / "results.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
     await update.message.reply_text(diag.summary(report)[:4000])
-
-
-SESSION_KEYBOARD = ReplyKeyboardMarkup(
-    [["Підрахувати", "Вивантажити сесію"], ["Нова сесія"]],
-    resize_keyboard=True,
-)
-
-
-def clock_text(seconds: int) -> str:
-    minutes, seconds = divmod(seconds, 60)
-    return f"{minutes:02}:{seconds:02}"
-
-
-async def session_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    items = context.chat_data.setdefault("session_videos", {})
-    action = message.text
-    if action == "Нова сесія":
-        items.clear()
-        await message.reply_text("Нову сесію розпочато. Надішли відео.", reply_markup=SESSION_KEYBOARD)
-        return
-
-    if message.video:
-        add_session_video(items, message)
-    elif message.document:
-        await message.reply_text(
-            "Надішли це відео як відеоповідомлення, щоб Telegram передав тривалість.",
-            reply_markup=SESSION_KEYBOARD,
-        )
-        return
-
-    if not items:
-        await message.reply_text("Сесія порожня.", reply_markup=SESSION_KEYBOARD)
-        return
-
-    total = sum(items.values())
-    if action == "Вивантажити сесію":
-        manifest = {"messages": sorted(items), "seconds": total}
-        await message.reply_text(
-            "Запит на вивантаження на Mac.\nREELS_EXPORT_V1 " + json.dumps(manifest),
-            reply_markup=SESSION_KEYBOARD,
-        )
-        return
-
-    await message.reply_text(session_summary(items), reply_markup=SESSION_KEYBOARD)
-
-
-def add_session_video(items: dict[int, int], message: Message) -> None:
-    duration = message.video.duration
-    items[message.message_id] = int(duration.total_seconds()) if hasattr(duration, "total_seconds") else duration
-
-
-def session_summary(items: dict[int, int]) -> str:
-    total = sum(items.values())
-    if total < 480:
-        target = f"до 8 хв ще {clock_text(480 - total)}"
-    elif total <= 600:
-        target = "у межах 8–10 хв"
-    else:
-        target = f"понад 10 хв на {clock_text(total - 600)}"
-    return f"Відео: {len(items)} · хрон {clock_text(total)} · {target}"
 
 
 async def serve_webhook(app: Application) -> None:
@@ -375,13 +309,6 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("diag", diag_command, filters=filters.ChatType.PRIVATE))
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & (
-            filters.VIDEO | filters.Document.VIDEO
-            | filters.Regex(r"^(Підрахувати|Вивантажити сесію|Нова сесія)$")
-        ),
-        session_message,
-    ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     if WEBHOOK_URL:
         asyncio.run(serve_webhook(app))
