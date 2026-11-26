@@ -65,7 +65,10 @@ FORMATS = [
     f"b[vcodec^=avc1][acodec^=mp4a][height<={height}]/"
     f"bv[vcodec^=avc1][height<={height}]+ba/"
     f"b[vcodec^=avc1][height<={height}]/"
-    f"bv[vcodec^=avc1][height<={height}]"
+    f"b[ext=mp4][height<={height}]/"
+    f"bv[ext=mp4][height<={height}]+ba[ext=m4a]/"
+    f"bv[vcodec^=avc1][height<={height}]/"
+    f"bv[ext=mp4][height<={height}]"
     for height in (1080, 720, 480)
 ]
 
@@ -95,7 +98,7 @@ def probe(path: Path) -> dict:
 
 
 def prepare_mp4(source: Path) -> Path:
-    """Write an MP4 with 8-bit H.264 video and optional AAC-LC audio."""
+    """Prepare H.264 MP4 for Premiere or keep the source MP4 as downloaded."""
     metadata = subprocess.run(
         ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(source)],
         capture_output=True, text=True, timeout=30, check=True,
@@ -104,7 +107,9 @@ def prepare_mp4(source: Path) -> Path:
     video = next(stream for stream in streams if stream["codec_type"] == "video")
     audio = next((stream for stream in streams if stream["codec_type"] == "audio"), None)
     if video.get("codec_name") != "h264" or video.get("pix_fmt") != "yuv420p":
-        raise ValueError("Джерело не надало сумісний потік H.264")
+        if source.suffix.lower() == ".mp4":
+            return source
+        raise ValueError("Джерело не надало сумісний потік H.264 або файл MP4")
     audio_options = ["-c:a", "copy"]
     if audio and (audio.get("codec_name") != "aac" or audio.get("profile") != "LC"):
         audio_options = ["-c:a", "aac", "-profile:a", "aac_low", "-b:a", "128k"]
@@ -144,7 +149,7 @@ def download(url: str, workdir: Path) -> tuple[Path, dict]:
                 info = ydl.extract_info(url, download=True)
         except Exception as e:  # noqa: BLE001 — yt-dlp кидає різні типи
             if "Requested format is not available" in str(e):
-                raise RuntimeError("Немає доступного відеопотоку H.264 потрібної якості") from e
+                raise RuntimeError("Немає доступного відео у форматі MP4") from e
             last_error = e
             if "429" in str(e) or "Too Many Requests" in str(e):
                 raise
