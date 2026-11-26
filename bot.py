@@ -91,6 +91,35 @@ def probe(path: Path) -> dict:
         return {}
 
 
+def prepare_mp4(source: Path) -> Path:
+    """Write an MP4 with 8-bit H.264 video and optional AAC-LC audio."""
+    metadata = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(source)],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    streams = json.loads(metadata.stdout)["streams"]
+    video = next(stream for stream in streams if stream["codec_type"] == "video")
+    audio = next((stream for stream in streams if stream["codec_type"] == "audio"), None)
+    video_options = ["-c:v", "copy"]
+    if video.get("codec_name") != "h264" or video.get("pix_fmt") != "yuv420p":
+        video_options = [
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2",
+            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
+        ]
+    audio_options = ["-c:a", "copy"]
+    if audio and (audio.get("codec_name") != "aac" or audio.get("profile") != "LC"):
+        audio_options = ["-c:a", "aac", "-profile:a", "aac_low", "-b:a", "128k"]
+
+    output = source.with_name("reel.mp4")
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(source),
+         "-map", "0:v:0", "-map", "0:a:0?", *video_options, *audio_options,
+         "-movflags", "+faststart", str(output)],
+        capture_output=True, text=True, timeout=120, check=True,
+    )
+    return output
+
+
 def download(url: str, workdir: Path) -> tuple[Path, dict]:
     """Завантажує відео й повертає шлях до файлу та метадані."""
     last_error = None
@@ -121,7 +150,14 @@ def download(url: str, workdir: Path) -> tuple[Path, dict]:
             continue
         files = sorted(workdir.glob("video.*"), key=lambda p: p.stat().st_size, reverse=True)
         if files and files[0].stat().st_size <= MAX_BYTES:
-            return files[0], probe(files[0])
+            try:
+                output = prepare_mp4(files[0])
+            except (subprocess.SubprocessError, ValueError, KeyError, StopIteration) as error:
+                log.warning("Не вдалося підготувати MP4: %s", error)
+                last_error = RuntimeError("Не вдалося підготувати сумісний MP4")
+                continue
+            if 0 < output.stat().st_size <= MAX_BYTES:
+                return output, probe(output)
         last_error = RuntimeError("Відео більше за 50 МБ навіть у низькій якості")
     raise last_error or RuntimeError("Не вдалося завантажити відео")
 
