@@ -61,13 +61,12 @@ URL_RE = re.compile(
 
 # Від найкращої якості до найлегшої — беремо першу, що влазить у 50 МБ
 FORMATS = [
-    "bv*[vcodec^=avc1][height<=1080]+ba[acodec^=mp4a]/"
-    "b[vcodec^=avc1][acodec^=mp4a][height<=1080]/"
-    "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4][height<=1080]/bv*[height<=1080]+ba/b",
-    "bv*[vcodec^=avc1][height<=720]+ba[acodec^=mp4a]/"
-    "b[vcodec^=avc1][acodec^=mp4a][height<=720]/"
-    "bv*[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/bv*[height<=720]+ba/b",
-    "bv*[height<=480]+ba/b[height<=480]/worst",
+    f"bv[vcodec^=avc1][height<={height}]+ba[acodec^=mp4a]/"
+    f"b[vcodec^=avc1][acodec^=mp4a][height<={height}]/"
+    f"bv[vcodec^=avc1][height<={height}]+ba/"
+    f"b[vcodec^=avc1][height<={height}]/"
+    f"bv[vcodec^=avc1][height<={height}]"
+    for height in (1080, 720, 480)
 ]
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
@@ -104,14 +103,8 @@ def prepare_mp4(source: Path) -> Path:
     streams = json.loads(metadata.stdout)["streams"]
     video = next(stream for stream in streams if stream["codec_type"] == "video")
     audio = next((stream for stream in streams if stream["codec_type"] == "audio"), None)
-    video_options = ["-c:v", "copy"]
     if video.get("codec_name") != "h264" or video.get("pix_fmt") != "yuv420p":
-        video_options = [
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-threads", "2",
-            "-vf", "scale='min(1280,iw)':'min(1280,ih)':"
-                   "force_original_aspect_ratio=decrease:force_divisible_by=2",
-            "-pix_fmt", "yuv420p",
-        ]
+        raise ValueError("Джерело не надало сумісний потік H.264")
     audio_options = ["-c:a", "copy"]
     if audio and (audio.get("codec_name") != "aac" or audio.get("profile") != "LC"):
         audio_options = ["-c:a", "aac", "-profile:a", "aac_low", "-b:a", "128k"]
@@ -119,15 +112,15 @@ def prepare_mp4(source: Path) -> Path:
     output = source.with_name("reel.mp4")
     subprocess.run(
         ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(source),
-         "-map", "0:v:0", "-map", "0:a:0?", *video_options, *audio_options,
+         "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", *audio_options,
          "-movflags", "+faststart", str(output)],
         capture_output=True, text=True, timeout=40, check=True,
     )
     return output
 
 
-def download(url: str, workdir: Path) -> tuple[Path, dict, str | None]:
-    """Повертає шлях, метадані та примітку, якщо надсилаємо оригінал."""
+def download(url: str, workdir: Path) -> tuple[Path, dict]:
+    """Повертає сумісний MP4 і його метадані."""
     last_error = None
     for fmt in FORMATS:
         for f in workdir.iterdir():
@@ -150,6 +143,8 @@ def download(url: str, workdir: Path) -> tuple[Path, dict, str | None]:
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
         except Exception as e:  # noqa: BLE001 — yt-dlp кидає різні типи
+            if "Requested format is not available" in str(e):
+                raise RuntimeError("Немає доступного відеопотоку H.264 потрібної якості") from e
             last_error = e
             if "429" in str(e) or "Too Many Requests" in str(e):
                 raise
@@ -158,17 +153,12 @@ def download(url: str, workdir: Path) -> tuple[Path, dict, str | None]:
         if files and files[0].stat().st_size <= MAX_BYTES:
             try:
                 output = prepare_mp4(files[0])
-            except subprocess.TimeoutExpired:
-                log.warning("Підготовка MP4 перевищила ліміт часу. Надсилаємо оригінал.")
-                return files[0], probe(files[0]), (
-                    "Надсилаю оригінал. Конвертація для Premiere не вклалася в ліміт часу."
-                )
             except (subprocess.SubprocessError, ValueError, KeyError, StopIteration) as error:
                 log.warning("Не вдалося підготувати MP4: %s", error)
                 last_error = RuntimeError("Не вдалося підготувати сумісний MP4")
                 continue
             if 0 < output.stat().st_size <= MAX_BYTES:
-                return output, probe(output), None
+                return output, probe(output)
         last_error = RuntimeError("Відео більше за 50 МБ навіть у низькій якості")
     raise last_error or RuntimeError("Не вдалося завантажити відео")
 
@@ -210,7 +200,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     path = None
     params = {}
     try:
-        path, info, caption = await asyncio.to_thread(download, url, workdir)
+        path, info = await asyncio.to_thread(download, url, workdir)
         params = {
             "supports_streaming": True,
             "width": info.get("width"),
@@ -220,7 +210,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         with path.open("rb") as f:
             await update.message.reply_video(
                 video=f,
-                caption=caption,
                 **params,
                 read_timeout=120,
                 write_timeout=120,
